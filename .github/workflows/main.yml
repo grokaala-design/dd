@@ -1,4 +1,4 @@
-name: RDP Testbed
+name: Proxy Testbed
 
 on:
   workflow_dispatch:
@@ -9,10 +9,10 @@ on:
         default: "360"
 
 env:
-  TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+  NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
 
 jobs:
-  rdp:
+  proxy:
     runs-on: windows-latest
     timeout-minutes: 360
 
@@ -21,114 +21,141 @@ jobs:
         shell: pwsh
         run: |
           $id = [guid]::NewGuid().ToString().Substring(0,6)
+          "PROXY_USER=ci_$id" | Out-File $env:GITHUB_ENV -Append
+          "PROXY_PASS=Pass123!!$((Get-Random -Minimum 1000 -Maximum 9999))" | Out-File $env:GITHUB_ENV -Append
 
-          "TEST_USER=ci_$id" | Out-File $env:GITHUB_ENV -Append
-          "HOSTNAME=gh-$id" | Out-File $env:GITHUB_ENV -Append
-
-      - name: Enable RDP
+      - name: Download 3proxy
         shell: pwsh
         run: |
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' `
-            -Value 0
+          # Download the latest 3proxy Windows x64 release
+          $url = "https://github.com/3proxy/3proxy/releases/download/0.9.4/3proxy-0.9.4-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\3proxy.zip"
+          Expand-Archive "$env:TEMP\3proxy.zip" -DestinationPath "C:\3proxy" -Force
 
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication' `
-            -Value 0
-
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
-          Set-Service TermService -StartupType Automatic
-          Restart-Service TermService -Force
-
-          Write-Host "RDP enabled"
-
-      - name: Create user
+      - name: Configure 3proxy
         shell: pwsh
         run: |
-          $password = "Pass123!!$((Get-Random -Minimum 1000 -Maximum 9999))"
+          # Create a minimal 3proxy.cfg with HTTP proxy on 3128 and authentication
+          $cfg = @"
+          nserver 8.8.8.8
+          nserver 8.8.4.4
+          nscache 65536
+          timeouts 1 5 30 60 180 1800 15 60
+          auth strong
+          users $env:PROXY_USER:CL:$env:PROXY_PASS
+          allow $env:PROXY_USER
+          proxy -p3128
+          "#
+          $cfg | Out-File "C:\3proxy\3proxy.cfg" -Encoding ASCII
+          Write-Host "3proxy configuration created."
 
-          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+      - name: Start 3proxy
+        shell: pwsh
+        run: |
+          Start-Process -FilePath "C:\3proxy\3proxy.exe" `
+            -ArgumentList "C:\3proxy\3proxy.cfg" `
+            -WindowStyle Hidden
+          Start-Sleep -Seconds 3   # give it a moment to bind
+          Write-Host "3proxy started on port 3128."
 
-          New-LocalUser `
-            -Name $env:TEST_USER `
-            -Password $secure `
-            -AccountNeverExpires
-
-          Add-LocalGroupMember `
-            -Group "Administrators" `
-            -Member $env:TEST_USER
-
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member $env:TEST_USER
-
-          "TEST_PASSWORD=$password" | Out-File $env:GITHUB_ENV -Append
-
-          Write-Host "::notice::USER: $env:TEST_USER"
-          Write-Host "::notice::PASS: $password"
-
-      - name: Install Tailscale
+      - name: Download ngrok
         shell: pwsh
         run: |
           Invoke-WebRequest `
-            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
-            -OutFile "$env:TEMP\tailscale.msi"
+            -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
+            -OutFile "$env:TEMP\ngrok.zip"
+          Expand-Archive "$env:TEMP\ngrok.zip" -DestinationPath "$env:TEMP\ngrok" -Force
 
-          Start-Process msiexec.exe `
-            -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /qn" `
-            -Wait
-
-          Start-Sleep 15
-
-      - name: Connect Tailscale
+      - name: Authenticate ngrok
         shell: pwsh
         run: |
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & "$env:TEMP\ngrok\ngrok.exe" config add-authtoken $env:NGROK_AUTH_TOKEN
 
-          & $ts up `
-            --authkey=$env:TS_AUTHKEY `
-            --hostname=$env:HOSTNAME `
-            --accept-routes
+      - name: Create ngrok TCP tunnel for proxy
+        shell: pwsh
+        run: |
+          # Start ngrok tunnel for the proxy port (3128)
+          Start-Process `
+            -FilePath "$env:TEMP\ngrok\ngrok.exe" `
+            -ArgumentList "tcp 3128" `
+            -WindowStyle Hidden
 
-          Start-Sleep 10
-
-          $ip = & $ts ip -4
-
-          if (-not $ip) {
-            throw "No Tailscale IP"
+          # Wait for the ngrok API to be ready and retrieve the public URL
+          $maxAttempts = 30
+          $attempt = 0
+          $tunnel = $null
+          while ($attempt -lt $maxAttempts -and -not $tunnel) {
+            Start-Sleep -Seconds 2
+            try {
+              $response = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop
+              $tunnel = $response.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
+            } catch { }
+            $attempt++
           }
 
-          "TS_IP=$ip" | Out-File $env:GITHUB_ENV -Append
+          if (-not $tunnel) {
+            throw "ngrok TCP tunnel did not come up in time."
+          }
+
+          $publicUrl = $tunnel.public_url   # e.g. tcp://0.tcp.ngrok.io:12345
+          $addrPort = $publicUrl -replace '^tcp://', ''
+          $parts = $addrPort.Split(':')
+          $ngrokHost = $parts[0]
+          $ngrokPort = $parts[1]
+
+          "NGROK_HOST=$ngrokHost" | Out-File $env:GITHUB_ENV -Append
+          "NGROK_PORT=$ngrokPort" | Out-File $env:GITHUB_ENV -Append
 
           Write-Host ""
           Write-Host "================================"
-          Write-Host "RDP READY"
-          Write-Host "IP: $ip"
-          Write-Host "USER: $env:TEST_USER"
-          Write-Host "PASS: $env:TEST_PASSWORD"
+          Write-Host "PROXY READY (ngrok TCP)"
+          Write-Host "Host: $ngrokHost"
+          Write-Host "Port: $ngrokPort"
+          Write-Host "USER: $env:PROXY_USER"
+          Write-Host "PASS: $env:PROXY_PASS"
           Write-Host "================================"
 
-      - name: Validate RDP
+      - name: Notify Discord
+        shell: pwsh
+        env:
+          DISCORD_NOTIFY_SECRET: ${{ secrets.DISCORD_NOTIFY_SECRET }}
+        run: |
+          $block = "========================" + [Environment]::NewLine +
+                   "PROXY READY (ngrok)" + [Environment]::NewLine +
+                   "HOST: $env:NGROK_HOST" + [Environment]::NewLine +
+                   "PORT: $env:NGROK_PORT" + [Environment]::NewLine +
+                   "USER: $env:PROXY_USER" + [Environment]::NewLine +
+                   "PASS: $env:PROXY_PASS" + [Environment]::NewLine +
+                   "========================"
+          $payload = @{ content = $block } | ConvertTo-Json
+          Invoke-RestMethod `
+            -Uri "https://gordp-discord-bot.gordp-discord-bot.workers.dev/notify" `
+            -Method Post `
+            -Headers @{ "X-Notify-Secret" = $env:DISCORD_NOTIFY_SECRET } `
+            -ContentType "application/json" `
+            -Body $payload
+
+      - name: Validate proxy locally
         shell: pwsh
         run: |
-          $test = Test-NetConnection `
-            -ComputerName $env:TS_IP `
-            -Port 3389
-
-          if (-not $test.TcpTestSucceeded) {
-            throw "RDP failed"
+          # Test that the local proxy responds to a simple HTTP request
+          $testUrl = "http://example.com"
+          $proxy = "http://$env:PROXY_USER:$env:PROXY_PASS@127.0.0.1:3128"
+          try {
+            $response = Invoke-WebRequest -Uri $testUrl -Proxy $proxy -UseBasicParsing -TimeoutSec 10
+            if ($response.StatusCode -eq 200) {
+              Write-Host "Local proxy test passed (HTTP 200)."
+            } else {
+              throw "Unexpected status code: $($response.StatusCode)"
+            }
+          } catch {
+            throw "Proxy validation failed: $_"
           }
-
-          Write-Host "RDP OK"
 
       - name: Keep alive
         shell: pwsh
         run: |
           $end = (Get-Date).AddMinutes(360)
-
           while ((Get-Date) -lt $end) {
             Write-Host "Alive: $(Get-Date)"
             Start-Sleep 60
@@ -138,14 +165,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          if (Get-LocalUser -Name $env:TEST_USER -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name $env:TEST_USER
-          }
-
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          if (Test-Path $ts) {
-            & $ts logout
-          }
-
+          # Stop 3proxy and ngrok processes
+          Get-Process 3proxy -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
           Write-Host "Cleanup done"
